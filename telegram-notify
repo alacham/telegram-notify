@@ -1,0 +1,207 @@
+#!/bin/bash
+
+# BSD 2-Clause License
+# 
+# Copyright (c) 2025, alacham
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+# 
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+# telegram-notify - A utility for sending Telegram notifications
+# Usage: telegram-notify [OPTIONS] [MESSAGE]
+
+set -e
+
+# Default values
+DEFAULT_CONFIG_FILE="/etc/telegram-notify.env"
+CONFIG_FILE=""
+TELEGRAM_TOKEN=""
+CHAT_ID=""
+PARSE_MODE=""
+DISABLE_NOTIFICATION=false
+READ_FROM_FILE=""
+MESSAGE=""
+
+# Function to display usage information
+show_help() {
+    cat << EOF
+Usage: telegram-notify [OPTIONS] [MESSAGE]
+
+A utility for sending Telegram notifications.
+
+Options:
+  -t, --token TOKEN          Telegram bot token (overrides config file and env var)
+  -i, --chat-id ID           Chat ID to send message to (overrides config file and env var)
+  -m, --markdown             Format message as Markdown
+  -H, --html                 Format message as HTML
+  -s, --silent               Send notification without sound
+  -f, --file FILE            Read message content from file
+  -c, --config FILE          Specify config file (default: $DEFAULT_CONFIG_FILE)
+  -h, --help                     Display this help message and exit
+
+Configuration:
+  Credentials can be provided in three ways (in order of precedence):
+  1. Command line arguments (-t, -i)
+  2. Environment variables (TELEGRAM_TOKEN, CHAT_ID)
+  3. Config file ($DEFAULT_CONFIG_FILE or specified with -c)
+
+  Example config file:
+    TELEGRAM_TOKEN="your-bot-token"
+    CHAT_ID="your-chat-id"
+
+If no MESSAGE is provided, the script will read from stdin.
+
+Examples:
+  telegram-notify "Hello, world!"
+  echo "Hello, world!" | telegram-notify
+  telegram-notify -m -f message.md
+  telegram-notify -c /path/to/custom/config "Custom config message"
+
+EOF
+    exit 0
+}
+
+# Function to escape markdown text
+escape_markdown() {
+    # Replace special characters with their escaped versions
+    echo "$1" | sed 's/\([_*\[\]()~`>#+=|{}.!-]\)/\\\1/g'
+}
+
+# Load the default config file if it exists
+if [[ -f "$DEFAULT_CONFIG_FILE" ]]; then
+    source "$DEFAULT_CONFIG_FILE"
+fi
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--token)
+            TELEGRAM_TOKEN="$2"
+            shift 2
+            ;;
+        -i|--chat-id)
+            CHAT_ID="$2"
+            shift 2
+            ;;
+        -m|--markdown)
+            PARSE_MODE="MarkdownV2"
+            shift
+            ;;
+        -H|--html)
+            PARSE_MODE="HTML"
+            shift
+            ;;
+        -s|--silent)
+            DISABLE_NOTIFICATION=true
+            shift
+            ;;
+        -f|--file)
+            READ_FROM_FILE="$2"
+            shift 2
+            ;;
+        -c|--config)
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            # If the argument doesn't start with a dash, it's the message
+            if [[ "$1" != -* ]]; then
+                MESSAGE="$1"
+                shift
+            else
+                echo "Unknown option: $1" >&2
+                show_help
+            fi
+            ;;
+    esac
+done
+
+# Load specified config file if provided
+if [[ -n "$CONFIG_FILE" ]]; then
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    else
+        echo "Error: Config file not found: $CONFIG_FILE" >&2
+        exit 1
+    fi
+fi
+
+# Verify required parameters
+if [[ -z "$TELEGRAM_TOKEN" ]]; then
+    echo "Error: Telegram token is required. Set it with -t/--token, TELEGRAM_TOKEN env var, or in config file." >&2
+    exit 1
+fi
+
+if [[ -z "$CHAT_ID" ]]; then
+    echo "Error: Chat ID is required. Set it with -c/--chat-id, CHAT_ID env var, or in config file." >&2
+    exit 1
+fi
+
+# Get message content
+if [[ -n "$READ_FROM_FILE" ]]; then
+    # Read from file
+    if [[ ! -f "$READ_FROM_FILE" ]]; then
+        echo "Error: File not found: $READ_FROM_FILE" >&2
+        exit 1
+    fi
+    MESSAGE=$(cat "$READ_FROM_FILE")
+elif [[ -z "$MESSAGE" ]]; then
+    # Read from stdin if no message provided and not reading from file
+    if [ -t 0 ]; then
+        # Terminal is interactive, show a prompt
+        echo "Enter your message (press Ctrl+D when finished):" >&2
+    fi
+    MESSAGE=$(cat)
+fi
+
+# Escape markdown if needed
+if [[ "$PARSE_MODE" == "MarkdownV2" ]]; then
+    MESSAGE=$(escape_markdown "$MESSAGE")
+fi
+
+# Prepare API request
+API_URL="https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage"
+DATA=(-d chat_id="$CHAT_ID" -d text="$MESSAGE")
+
+# Add optional parameters
+if [[ -n "$PARSE_MODE" ]]; then
+    DATA+=(-d parse_mode="$PARSE_MODE")
+fi
+
+if [[ "$DISABLE_NOTIFICATION" == true ]]; then
+    DATA+=(-d disable_notification=true)
+fi
+
+# Send the message
+response=$(curl -s -X POST "$API_URL" "${DATA[@]}")
+
+# Check for errors
+if echo "$response" | grep -q '"ok":false'; then
+    error_description=$(echo "$response" | grep -o '"description":"[^"]*"' | cut -d'"' -f4)
+    echo "Error sending message: $error_description" >&2
+    exit 1
+else
+    echo "Message sent successfully!" >&2
+fi
